@@ -1,8 +1,16 @@
 # Go Real-Time Market Data WebSocket Server
 
-A compact, production-style WebSocket backend in Go that simulates real-time market ticker streams.
+A production-inspired real-time market data WebSocket server in Go showcasing pub/sub architecture, high-concurrency design, rate limiting, and scalable backend patterns.
 
-This project is intentionally small but engineered with the patterns expected in real backend systems: concurrent client handling, subscription indexing, backpressure safety, rate limiting, heartbeat, graceful shutdown, and structured logging.
+## System Flow
+
+```mermaid
+flowchart LR
+  Client -->|subscribe| WSHandler
+  WSHandler --> Hub
+  Producer -->|ticker events| Hub
+  Hub -->|broadcast| Client
+```
 
 ## Tech Stack
 

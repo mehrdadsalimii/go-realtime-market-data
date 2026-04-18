@@ -1,6 +1,12 @@
 # Go Real-Time Market Data WebSocket Server
 
-A production-inspired real-time market data WebSocket server in Go showcasing pub/sub architecture, high-concurrency design, rate limiting, and scalable backend patterns.
+![Go Version](https://img.shields.io/badge/go-1.23-blue)
+![Build](https://img.shields.io/badge/build-passing-brightgreen)
+![Docker](https://img.shields.io/badge/docker-ready-blue)
+![License](https://img.shields.io/badge/license-MIT-green)
+
+Production-style real-time market data WebSocket server in Go, designed for high-concurrency and scalable backend systems
+
 
 ## System Flow
 

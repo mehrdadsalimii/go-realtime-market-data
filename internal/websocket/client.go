@@ -2,63 +2,69 @@ package websocket
 
 import (
 	"encoding/json"
-	"log"
+	"log/slog"
+	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
 )
 
-const (
-	writeWait      = 10 * time.Second
-	pongWait       = 60 * time.Second
-	pingPeriod     = 54 * time.Second
-	maxMessageSize = 1024
-)
-
-type subscription struct {
-	Channel string `json:"channel"`
-	Symbol  string `json:"symbol"`
-}
-
-type wsRequest struct {
-	Op      string `json:"op"`
-	Channel string `json:"channel"`
-	Symbol  string `json:"symbol"`
-}
-
-type wsResponse struct {
-	Op      string `json:"op,omitempty"`
-	Result  string `json:"result,omitempty"`
-	Error   string `json:"error,omitempty"`
-	Channel string `json:"channel,omitempty"`
-	Symbol  string `json:"symbol,omitempty"`
+type ClientOptions struct {
+	SendBuffer      int
+	ReadLimitBytes  int64
+	WriteTimeout    time.Duration
+	PongWait        time.Duration
+	PingInterval    time.Duration
+	RateLimitPerSec int
 }
 
 type Client struct {
-	hub          *Hub
-	conn         *websocket.Conn
-	send         chan []byte
-	subscription *subscription
+	id          string
+	hub         *Hub
+	conn        *websocket.Conn
+	logger      *slog.Logger
+	send        chan []byte
+	rateLimiter *RateLimiter
+	opts        ClientOptions
+	closeOnce   sync.Once
 }
 
-func NewClient(hub *Hub, conn *websocket.Conn) *Client {
+func NewClient(id string, hub *Hub, conn *websocket.Conn, logger *slog.Logger, opts ClientOptions) *Client {
+	if opts.SendBuffer <= 0 {
+		opts.SendBuffer = 64
+	}
+	if opts.ReadLimitBytes <= 0 {
+		opts.ReadLimitBytes = 4096
+	}
+	if opts.WriteTimeout <= 0 {
+		opts.WriteTimeout = 10 * time.Second
+	}
+	if opts.PongWait <= 0 {
+		opts.PongWait = 60 * time.Second
+	}
+	if opts.PingInterval <= 0 {
+		opts.PingInterval = (opts.PongWait * 9) / 10
+	}
+
 	return &Client{
-		hub:  hub,
-		conn: conn,
-		send: make(chan []byte, 16),
+		id:          id,
+		hub:         hub,
+		conn:        conn,
+		logger:      logger.With(slog.String("client_id", id)),
+		send:        make(chan []byte, opts.SendBuffer),
+		rateLimiter: NewRateLimiter(opts.RateLimitPerSec, time.Second),
+		opts:        opts,
 	}
 }
 
-func (c *Client) Read() {
-	defer func() {
-		c.hub.unregister <- c
-		_ = c.conn.Close()
-	}()
+func (c *Client) ReadLoop() {
+	defer c.Close()
 
-	c.conn.SetReadLimit(maxMessageSize)
-	_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+	c.conn.SetReadLimit(c.opts.ReadLimitBytes)
+	_ = c.conn.SetReadDeadline(time.Now().Add(c.opts.PongWait))
 	c.conn.SetPongHandler(func(string) error {
-		_ = c.conn.SetReadDeadline(time.Now().Add(pongWait))
+		_ = c.conn.SetReadDeadline(time.Now().Add(c.opts.PongWait))
 		return nil
 	})
 
@@ -66,81 +72,135 @@ func (c *Client) Read() {
 		_, raw, err := c.conn.ReadMessage()
 		if err != nil {
 			if websocket.IsUnexpectedCloseError(err, websocket.CloseGoingAway, websocket.CloseAbnormalClosure) {
-				log.Printf("unexpected websocket close: %v", err)
+				c.logger.Warn("unexpected websocket close", slog.String("error", err.Error()))
 			}
 			return
 		}
 
-		var req wsRequest
-		if err := json.Unmarshal(raw, &req); err != nil {
-			c.sendError("invalid json")
+		if !c.rateLimiter.Allow(time.Now()) {
+			c.sendError("rate_limit", "too many requests")
+			c.logger.Warn("rate limit exceeded")
+			return
+		}
+
+		var msg ClientMessage
+		if err := json.Unmarshal(raw, &msg); err != nil {
+			c.sendError("invalid_json", "request body is not valid JSON")
 			continue
 		}
 
-		switch req.Op {
+		switch strings.ToLower(strings.TrimSpace(msg.Op)) {
 		case "subscribe":
-			c.handleSubscribe(req)
+			c.handleSubscribe(msg.Args)
 		case "unsubscribe":
-			c.subscription = nil
-			c.sendJSON(wsResponse{Op: "unsubscribe", Result: "ok"})
+			c.handleUnsubscribe(msg.Args)
 		default:
-			c.sendError("unsupported op")
+			c.sendError("unsupported_op", "supported operations are subscribe and unsubscribe")
 		}
 	}
 }
 
-func (c *Client) Write() {
-	ticker := time.NewTicker(pingPeriod)
+func (c *Client) WriteLoop() {
+	pingTicker := time.NewTicker(c.opts.PingInterval)
 	defer func() {
-		ticker.Stop()
+		pingTicker.Stop()
 		_ = c.conn.Close()
 	}()
 
 	for {
 		select {
-		case msg, ok := <-c.send:
-			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+		case payload, ok := <-c.send:
 			if !ok {
-				_ = c.conn.WriteMessage(websocket.CloseMessage, []byte{})
+				_ = c.conn.SetWriteDeadline(time.Now().Add(c.opts.WriteTimeout))
+				_ = c.conn.WriteMessage(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, ""))
 				return
 			}
-			if err := c.conn.WriteMessage(websocket.TextMessage, msg); err != nil {
+
+			_ = c.conn.SetWriteDeadline(time.Now().Add(c.opts.WriteTimeout))
+			if err := c.conn.WriteMessage(websocket.TextMessage, payload); err != nil {
+				c.logger.Warn("write failed", slog.String("error", err.Error()))
+				c.Close()
 				return
 			}
-		case <-ticker.C:
-			_ = c.conn.SetWriteDeadline(time.Now().Add(writeWait))
+		case <-pingTicker.C:
+			_ = c.conn.SetWriteDeadline(time.Now().Add(c.opts.WriteTimeout))
 			if err := c.conn.WriteMessage(websocket.PingMessage, nil); err != nil {
+				c.logger.Warn("ping failed", slog.String("error", err.Error()))
+				c.Close()
 				return
 			}
 		}
 	}
 }
 
-func (c *Client) handleSubscribe(req wsRequest) {
-	if req.Channel != "ticker" {
-		c.sendError("only ticker channel is supported in this basic example")
-		return
+func (c *Client) Enqueue(payload []byte) bool {
+	select {
+	case c.send <- payload:
+		return true
+	default:
+		return false
 	}
-	if req.Symbol == "" {
-		c.sendError("symbol is required")
-		return
-	}
+}
 
-	c.subscription = &subscription{
-		Channel: req.Channel,
-		Symbol:  req.Symbol,
-	}
-
-	c.sendJSON(wsResponse{
-		Op:      "subscribe",
-		Result:  "ok",
-		Channel: req.Channel,
-		Symbol:  req.Symbol,
+func (c *Client) Close() {
+	c.closeOnce.Do(func() {
+		c.hub.Unregister(c)
+		_ = c.conn.Close()
 	})
 }
 
-func (c *Client) sendError(msg string) {
-	c.sendJSON(wsResponse{Error: msg})
+func (c *Client) handleSubscribe(args []Subscription) {
+	if len(args) == 0 {
+		c.sendError("invalid_args", "subscribe requires at least one argument")
+		return
+	}
+
+	normalized := make([]Subscription, 0, len(args))
+	for _, sub := range args {
+		ns, err := normalizeAndValidateSubscription(sub)
+		if err != nil {
+			c.sendError("invalid_subscription", err.Error())
+			return
+		}
+		normalized = append(normalized, ns)
+	}
+
+	if err := c.hub.Subscribe(c, normalized); err != nil {
+		c.sendError("subscribe_failed", err.Error())
+		return
+	}
+	c.sendAck("subscribe", normalized)
+}
+
+func (c *Client) handleUnsubscribe(args []Subscription) {
+	if len(args) == 0 {
+		c.sendError("invalid_args", "unsubscribe requires at least one argument")
+		return
+	}
+
+	normalized := make([]Subscription, 0, len(args))
+	for _, sub := range args {
+		ns, err := normalizeAndValidateSubscription(sub)
+		if err != nil {
+			c.sendError("invalid_subscription", err.Error())
+			return
+		}
+		normalized = append(normalized, ns)
+	}
+
+	if err := c.hub.Unsubscribe(c, normalized); err != nil {
+		c.sendError("unsubscribe_failed", err.Error())
+		return
+	}
+	c.sendAck("unsubscribe", normalized)
+}
+
+func (c *Client) sendAck(op string, args []Subscription) {
+	c.sendJSON(AckMessage{Type: "ack", Op: op, Result: "ok", Args: args})
+}
+
+func (c *Client) sendError(code, msg string) {
+	c.sendJSON(ErrorMessage{Type: "error", Code: code, Message: msg})
 }
 
 func (c *Client) sendJSON(v any) {
@@ -148,5 +208,7 @@ func (c *Client) sendJSON(v any) {
 	if err != nil {
 		return
 	}
-	c.send <- payload
+	if !c.Enqueue(payload) {
+		c.logger.Warn("dropping message because client queue is full")
+	}
 }

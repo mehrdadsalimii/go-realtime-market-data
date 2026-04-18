@@ -1,0 +1,9 @@
+# Go build artifacts
+/bin/
+*.exe
+*.test
+*.out
+
+# IDE/macOS
+.idea/
+.DS_Store
